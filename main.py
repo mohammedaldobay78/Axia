@@ -7,40 +7,46 @@ from pymongo import MongoClient
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- الإعدادات (تأكد من إضافتها في Environment Variables على Render) ---
+# --- الإعدادات ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CHANNEL_ID = "@Axia_Tech"
-# تحويل ADMIN_ID إلى رقم صحيح (int) لأن الـ ID في تليجرام رقمي
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-# رابط MongoDB من الصورة image_73203a.png
 MONGO_URI = os.getenv("MONGO_URI") 
 
-# إعداد Flask (مطلوب لاستقبال طلبات Webhook و Cron-job)
 app = Flask(__name__)
 
-# إعداد قاعدة البيانات MongoDB
-client = MongoClient(MONGO_URI)
-db = client['AxiaTechDB']  # اسم قاعدة البيانات
-collection = db['posted_news']  # اسم الجدول/المجموعة
+# --- إعداد MongoDB مع إضافة معايير استقرار الاتصال ---
+# أضفنا serverSelectionTimeoutMS لتجنب تعليق الكود لفترة طويلة إذا فشل الاتصال
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+db = client['AxiaTechDB']
+collection = db['posted_news']
 
 # إعداد Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# دالة التأكد من عدم التكرار (باستخدام MongoDB)
 def is_posted(link):
-    return collection.find_one({"link": link}) is not None
+    try:
+        return collection.find_one({"link": link}) is not None
+    except Exception as e:
+        print(f"MongoDB Lookup Error: {e}")
+        return True # نرجع True في حال الخطأ لتجنب تكرار النشر العشوائي
 
 def save_link(link):
-    collection.insert_one({"link": link})
+    try:
+        collection.insert_one({"link": link})
+    except Exception as e:
+        print(f"MongoDB Insert Error: {e}")
 
-# معالجة الخبر باستخدام Gemini
 async def process_news_with_gemini(title, summary):
+    # تنظيف النص من أي وسوم HTML قد تعطل Gemini أو Telegram
+    clean_summary = summary.replace('<p>', '').replace('</p>', '').strip()
+    
     prompt = f"""
     قم بترجمة وتلخيص الخبر التالي للغة العربية بأسلوب تقني شيق وقوي:
     العنوان: {title}
-    التفاصيل: {summary}
+    التفاصيل: {clean_summary}
     
     المطلوب:
     1. صياغة الخبر بأسلوب مناسب لقنوات تليجرام (استخدم الإيموجي).
@@ -50,7 +56,6 @@ async def process_news_with_gemini(title, summary):
     response = model.generate_content(prompt)
     return response.text
 
-# الوظيفة الأساسية لجلب الأخبار
 async def fetch_and_post_news():
     feeds = [
         "https://techcrunch.com/feed/",
@@ -59,9 +64,11 @@ async def fetch_and_post_news():
         "https://www.engadget.com/rss.xml"
     ]
     
+    # استخدام session واحدة لتسريع عملية الإرسال
     bot = Bot(token=TELEGRAM_TOKEN)
     
     for url in feeds:
+        print(f"Checking feed: {url}")
         feed = feedparser.parse(url)
         for entry in feed.entries[:3]:
             if not is_posted(entry.link):
@@ -71,24 +78,26 @@ async def fetch_and_post_news():
                     
                     await bot.send_message(chat_id=CHANNEL_ID, text=final_text)
                     save_link(entry.link)
-                    print(f"تم نشر خبر جديد: {entry.title}")
+                    print(f"Success: {entry.title}")
+                    # تأخير بسيط لتجنب الـ Spam Detection من تليجرام
+                    await asyncio.sleep(2) 
                 except Exception as e:
-                    print(f"Error processing news: {e}")
+                    print(f"Error in processing entry: {e}")
 
-# مسارات Flask
 @app.route('/')
 def home():
-    return "Bot is alive!"
+    return "Axia Tech Bot is Online!"
 
-# هذا الرابط ستستخدمه في Cron-job.org لتشغيل البوت تلقائياً
 @app.route('/fetch')
 def manual_fetch():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(fetch_and_post_news())
-    return "Fetch cycle completed!"
+    try:
+        # استخدام الطريقة الصحيحة لتشغيل asyncio داخل Flask
+        asyncio.run(fetch_and_post_news())
+        return "Fetch cycle completed successfully!"
+    except Exception as e:
+        print(f"Critical Error in manual_fetch: {e}")
+        return f"Error: {e}", 500
 
 if __name__ == '__main__':
-    # Render يحدد المنفذ تلقائياً عبر متغير البيئة PORT
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
