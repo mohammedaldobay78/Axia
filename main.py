@@ -1,11 +1,11 @@
 import os
 import asyncio
 import feedparser
-import google.generativeai as genai
+# استيراد المكتبة الجديدة
+from google import genai
 from flask import Flask, request
 from pymongo import MongoClient
 from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- الإعدادات ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -16,22 +16,22 @@ MONGO_URI = os.getenv("MONGO_URI")
 
 app = Flask(__name__)
 
-# --- إعداد MongoDB مع إضافة معايير استقرار الاتصال ---
-# أضفنا serverSelectionTimeoutMS لتجنب تعليق الكود لفترة طويلة إذا فشل الاتصال
+# --- إعداد MongoDB ---
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = client['AxiaTechDB']
 collection = db['posted_news']
 
-# إعداد Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+# --- إعداد Gemini بالمكتبة الجديدة ---
+# يتم تمرير مفتاح الواجهة البرمجية (API Key) مباشرة للعميل (Client)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_NAME = "gemini-3-flash-preview"
 
 def is_posted(link):
     try:
         return collection.find_one({"link": link}) is not None
     except Exception as e:
         print(f"MongoDB Lookup Error: {e}")
-        return True # نرجع True في حال الخطأ لتجنب تكرار النشر العشوائي
+        return True
 
 def save_link(link):
     try:
@@ -40,7 +40,6 @@ def save_link(link):
         print(f"MongoDB Insert Error: {e}")
 
 async def process_news_with_gemini(title, summary):
-    # تنظيف النص من أي وسوم HTML قد تعطل Gemini أو Telegram
     clean_summary = summary.replace('<p>', '').replace('</p>', '').strip()
     
     prompt = f"""
@@ -53,7 +52,12 @@ async def process_news_with_gemini(title, summary):
     2. وضع هاشتاجات ذكية داخل النص (مثال: #جوجل، #AI).
     3. في النهاية، أضف هاشتاجات التصنيف: #تقنية #أخبار_التقنية #Axia_Tech.
     """
-    response = model.generate_content(prompt)
+    
+    # استدعاء Gemini باستخدام الطريقة الجديدة
+    response = gemini_client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+    )
     return response.text
 
 async def fetch_and_post_news():
@@ -64,7 +68,6 @@ async def fetch_and_post_news():
         "https://www.engadget.com/rss.xml"
     ]
     
-    # استخدام session واحدة لتسريع عملية الإرسال
     bot = Bot(token=TELEGRAM_TOKEN)
     
     for url in feeds:
@@ -79,7 +82,6 @@ async def fetch_and_post_news():
                     await bot.send_message(chat_id=CHANNEL_ID, text=final_text)
                     save_link(entry.link)
                     print(f"Success: {entry.title}")
-                    # تأخير بسيط لتجنب الـ Spam Detection من تليجرام
                     await asyncio.sleep(2) 
                 except Exception as e:
                     print(f"Error in processing entry: {e}")
@@ -91,7 +93,6 @@ def home():
 @app.route('/fetch')
 def manual_fetch():
     try:
-        # استخدام الطريقة الصحيحة لتشغيل asyncio داخل Flask
         asyncio.run(fetch_and_post_news())
         return "Fetch cycle completed successfully!"
     except Exception as e:
