@@ -1,0 +1,5 @@
+python-telegram-bot
+google-generativeai
+feedparser
+flask
+pymongo[srv]

@@ -1,108 +1,94 @@
-import logging
-import feedparser
-import sqlite3
-import google.generativeai as genai
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 import os
+import asyncio
+import feedparser
+import google.generativeai as genai
+from flask import Flask, request
+from pymongo import MongoClient
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- الإعدادات ---
-TELEGRAM_TOKEN = os.getenv("YOUR_TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("YOUR_GEMINI_API_KEY")
-CHANNEL_ID = "@Axia_Tech"  # معرف قناتك
-ADMIN_ID = os.getenv("Admin")  # أيدي حسابك الشخصي فقط
-WEBHOOK_URL = "https://your-domain.com/webhook"
+# --- الإعدادات (تأكد من إضافتها في Environment Variables على Render) ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+CHANNEL_ID = "@Axia_Tech"
+# تحويل ADMIN_ID إلى رقم صحيح (int) لأن الـ ID في تليجرام رقمي
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# رابط MongoDB من الصورة image_73203a.png
+MONGO_URI = os.getenv("MONGO_URI") 
+
+# إعداد Flask (مطلوب لاستقبال طلبات Webhook و Cron-job)
+app = Flask(__name__)
+
+# إعداد قاعدة البيانات MongoDB
+client = MongoClient(MONGO_URI)
+db = client['AxiaTechDB']  # اسم قاعدة البيانات
+collection = db['posted_news']  # اسم الجدول/المجموعة
 
 # إعداد Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
-# إعداد قاعدة البيانات لمنع التكرار
-def init_db():
-    conn = sqlite3.connect('news.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS posted_news (link TEXT PRIMARY KEY)''')
-    conn.commit()
-    conn.close()
-
+# دالة التأكد من عدم التكرار (باستخدام MongoDB)
 def is_posted(link):
-    conn = sqlite3.connect('news.db')
-    c = conn.cursor()
-    c.execute("SELECT * FROM posted_news WHERE link=?", (link,))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
+    return collection.find_one({"link": link}) is not None
 
 def save_link(link):
-    conn = sqlite3.connect('news.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO posted_news VALUES (?)", (link,))
-    conn.commit()
-    conn.close()
+    collection.insert_one({"link": link})
 
 # معالجة الخبر باستخدام Gemini
 async def process_news_with_gemini(title, summary):
     prompt = f"""
-    قم بترجمة وتلخيص الخبر التالي للغة العربية بأسلوب تقني شيق:
+    قم بترجمة وتلخيص الخبر التالي للغة العربية بأسلوب تقني شيق وقوي:
     العنوان: {title}
     التفاصيل: {summary}
     
     المطلوب:
-    1. صياغة الخبر بأسلوب مناسب لقنوات تليجرام.
-    2. وضع هاشتاجات مناسبة داخل النص (مثل #جوجل، #مايكروسوفت).
-    3. في نهاية المنشور، أضف هاشتاجات تصنيف عامة مثل #تقنية #ذكاء_اصطناعي.
+    1. صياغة الخبر بأسلوب مناسب لقنوات تليجرام (استخدم الإيموجي).
+    2. وضع هاشتاجات ذكية داخل النص (مثال: #جوجل، #AI).
+    3. في النهاية، أضف هاشتاجات التصنيف: #تقنية #أخبار_التقنية #Axia_Tech.
     """
     response = model.generate_content(prompt)
     return response.text
 
-# جلب الأخبار ونشرها
-async def fetch_and_post_news(context: ContextTypes.DEFAULT_TYPE):
+# الوظيفة الأساسية لجلب الأخبار
+async def fetch_and_post_news():
     feeds = [
         "https://techcrunch.com/feed/",
         "https://www.theverge.com/rss/index.xml",
         "https://openai.com/news/rss.xml",
-        "https://www.engadget.com/rss.xml",
-        "https://www.reuters.com/technology/",
-        ""
+        "https://www.engadget.com/rss.xml"
     ]
+    
+    bot = Bot(token=TELEGRAM_TOKEN)
     
     for url in feeds:
         feed = feedparser.parse(url)
-        for entry in feed.entries[:3]: # فحص آخر 3 أخبار من كل مصدر
+        for entry in feed.entries[:3]:
             if not is_posted(entry.link):
                 try:
                     formatted_news = await process_news_with_gemini(entry.title, entry.summary)
                     final_text = f"{formatted_news}\n\n🔗 المصدر: {entry.link}"
                     
-                    await context.bot.send_message(chat_id=CHANNEL_ID, text=final_text)
+                    await bot.send_message(chat_id=CHANNEL_ID, text=final_text)
                     save_link(entry.link)
+                    print(f"تم نشر خبر جديد: {entry.title}")
                 except Exception as e:
                     print(f"Error processing news: {e}")
 
-# تقييد الوصول (الأمان)
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return # تجاهل أي شخص غيرك
-    await update.message.reply_text("البوت يعمل بنجاح ومخصص لهذه القناة فقط.")
+# مسارات Flask
+@app.route('/')
+def home():
+    return "Bot is alive!"
 
-def main():
-    init_db()
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # إضافة الأوامر
-    application.add_handler(CommandHandler("start", start))
-
-    # جدولة جلب الأخبار كل 30 دقيقة
-    job_queue = application.job_queue
-    job_queue.run_repeating(fetch_and_post_news, interval=1800, first=10)
-
-    # تشغيل Webhook
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", "8443")),
-        url_path=TELEGRAM_TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
-    )
+# هذا الرابط ستستخدمه في Cron-job.org لتشغيل البوت تلقائياً
+@app.route('/fetch')
+def manual_fetch():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(fetch_and_post_news())
+    return "Fetch cycle completed!"
 
 if __name__ == '__main__':
-    main()
+    # Render يحدد المنفذ تلقائياً عبر متغير البيئة PORT
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
